@@ -17,7 +17,8 @@
     <h1 style="font-size:20px">Gramofon için YouTube aracısı</h1>
     <p>Bu sayfa oyunun içinde, görünmez bir çerçevede kullanılır. Oyunun kendi sayfaları YouTube'a geçerli bir adres
       gösteremediği için (YouTube hata 153), oynatıcı bu https sayfasının içinde açılır. Sayfa yalnızca kendisini çerçeve
-      olarak yükleyen sayfadan gelen çal / ses / durdur komutlarını uygular; başka bir şey yapmaz ve hiçbir veri toplamaz.</p>
+      olarak yükleyen sayfadan gelen çal / ses / durdur komutlarını uygular. Çığırtkan için, yine yalnız oyunun komutuyla,
+      mikrofonu en fazla 15 saniye açıp kaydı yalnız oyuna geri verir; hiçbir veri toplamaz ve başka yere göndermez.</p>
   </div>
   <script>
   // Auralis ses calar (ui/sescalar) YouTube aracisi. GitHub Pages gibi bir https adresinde durur; oyun sayfasi
@@ -25,10 +26,15 @@
   //   ust -> araci: {kanal:'aur-yt', tip:'yukle', ad, surum, vid, gecen, zaman, dongu, durdu, ses} | {tip:'ses', ad, ses}
   //                 | {tip:'durum', ad, durdu, gecen, zaman} | {tip:'sil', ad} | {tip:'hepsiniSil'}
   //   araci -> ust: {kanal:'aur-yt', tip:'hazir'} | {tip:'olay', olay:'sure'|'bitti'|'hata', ad, surum, sure, baslik, kod}
+  // Surum 2 (cigirtkan kaydi; oyunun fw:// sayfalari mikrofonu acamiyor, NotAllowedError):
+  //   ust -> araci: {tip:'mikrofonTest', id} | {tip:'kayitBasla', id, azamiMs} | {tip:'kayitBitir', id} | {tip:'kayitIptal', id}
+  //   araci -> ust: {tip:'mikrofon', id, ok, ad, mesaj, guvenli} | {tip:'kayitDurum', id, durum:'basladi'|'hata', ad, mesaj, mime}
+  //                 | {tip:'kayitSeviye', id, seviye 0..1} | {tip:'kayitVeri', id, veriUrl, sureMs}
+  // Mikrofon yalniz ust sayfanin komutuyla ve en fazla 15 sn acilir; kayit yalniz ust sayfaya geri yollanir.
   // Yalniz kendisini yukleyen ust pencereden gelen mesajlari dinler.
   (function () {
     var KANAL = 'aur-yt';
-    var SURUM = 1;
+    var SURUM = 2;
     var ust = window.parent;
     if (!ust || ust === window) { document.getElementById('bilgi').style.display = 'block'; return; }
     var kutu = document.getElementById('kutu');
@@ -145,6 +151,68 @@
       } catch (e) { /* yut */ }
     }
 
+    // ---------------- mikrofon / kayit (surum 2) ----------------
+    var kayit = null;
+    function mikrofonAc() {
+      if (!navigator.mediaDevices || typeof navigator.mediaDevices.getUserMedia !== 'function') {
+        var e = new Error('mediaDevices yok'); e.name = 'mediaDevices_yok'; return Promise.reject(e);
+      }
+      return navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, channelCount: 1 } });
+    }
+    function hataBilgi(e) { return { ad: String((e && e.name) || 'hata'), mesaj: String((e && e.message) || '').slice(0, 200) }; }
+    function kayitKapat(k, yolla_) {
+      if (!k || k.bitti) return;
+      k.bitti = true;
+      clearTimeout(k.zaman);
+      clearInterval(k.seviyeZaman);
+      try { if (k.ctx) k.ctx.close(); } catch (e) { /* yut */ }
+      if (k.kaydedici && k.kaydedici.state !== 'inactive') { k.gonder = yolla_; try { k.kaydedici.stop(); } catch (e) { /* yut */ } }
+      else if (k.akim) k.akim.getTracks().forEach(function (t) { try { t.stop(); } catch (x) { /* yut */ } });
+      if (kayit === k) kayit = null;
+    }
+    function kayitBasla(m) {
+      if (kayit) kayitKapat(kayit, false);
+      var k = { id: m.id, bitti: false, parcalar: [], bas: Date.now(), gonder: true };
+      kayit = k;
+      var azami = Math.max(500, Math.min(15000, Number(m.azamiMs) || 12000));
+      mikrofonAc().then(function (akim) {
+        if (k.bitti) { akim.getTracks().forEach(function (t) { t.stop(); }); return; }
+        k.akim = akim;
+        var mime = window.MediaRecorder && MediaRecorder.isTypeSupported('audio/webm;codecs=opus') ? 'audio/webm;codecs=opus' : 'audio/webm';
+        k.kaydedici = new MediaRecorder(akim, { mimeType: mime, audioBitsPerSecond: 24000 });
+        k.kaydedici.ondataavailable = function (e) { if (e.data && e.data.size) k.parcalar.push(e.data); };
+        k.kaydedici.onstop = function () {
+          akim.getTracks().forEach(function (t) { try { t.stop(); } catch (x) { /* yut */ } });
+          if (!k.gonder) return;
+          var okuyucu = new FileReader();
+          okuyucu.onload = function () { yolla({ tip: 'kayitVeri', id: k.id, veriUrl: String(okuyucu.result || ''), sureMs: Date.now() - k.bas }); };
+          okuyucu.readAsDataURL(new Blob(k.parcalar, { type: mime.split(';')[0] }));
+        };
+        try {
+          k.ctx = new (window.AudioContext || window.webkitAudioContext)();
+          var an = k.ctx.createAnalyser();
+          an.fftSize = 512;
+          k.ctx.createMediaStreamSource(akim).connect(an);
+          var buf = new Uint8Array(an.fftSize);
+          k.seviyeZaman = setInterval(function () {
+            an.getByteTimeDomainData(buf);
+            var t = 0;
+            for (var i = 0; i < buf.length; i++) { var x = (buf[i] - 128) / 128; t += x * x; }
+            yolla({ tip: 'kayitSeviye', id: k.id, seviye: Math.min(1, Math.sqrt(t / buf.length) * 3) });
+          }, 100);
+        } catch (e) { /* seviye olmadan da kaydeder */ }
+        k.kaydedici.start(250);
+        k.bas = Date.now();
+        k.zaman = setTimeout(function () { kayitKapat(k, true); }, azami);
+        yolla({ tip: 'kayitDurum', id: k.id, durum: 'basladi', mime: mime });
+      }, function (e) {
+        if (kayit === k) kayit = null;
+        k.bitti = true;
+        var h = hataBilgi(e);
+        yolla({ tip: 'kayitDurum', id: k.id, durum: 'hata', ad: h.ad, mesaj: h.mesaj });
+      });
+    }
+
     window.addEventListener('message', function (e) {
       if (e.source !== ust) return;
       var m = e.data;
@@ -156,6 +224,18 @@
       else if (m.tip === 'sil') { yokEt(sesler[m.ad]); delete sesler[m.ad]; }
       else if (m.tip === 'hepsiniSil') { Object.keys(sesler).forEach(function (a) { yokEt(sesler[a]); }); sesler = {}; }
       else if (m.tip === 'merhaba') yolla({ tip: 'hazir', surum: SURUM });
+      else if (m.tip === 'mikrofonTest') {
+        mikrofonAc().then(function (akim) {
+          akim.getTracks().forEach(function (t) { t.stop(); });
+          yolla({ tip: 'mikrofon', id: m.id, ok: true, ad: 'tamam', mesaj: '', guvenli: !!window.isSecureContext });
+        }, function (x) {
+          var h = hataBilgi(x);
+          yolla({ tip: 'mikrofon', id: m.id, ok: false, ad: h.ad, mesaj: h.mesaj, guvenli: !!window.isSecureContext });
+        });
+      }
+      else if (m.tip === 'kayitBasla') kayitBasla(m);
+      else if (m.tip === 'kayitBitir') { if (kayit && kayit.id === m.id) kayitKapat(kayit, true); }
+      else if (m.tip === 'kayitIptal') { if (kayit && kayit.id === m.id) kayitKapat(kayit, false); }
     });
     yolla({ tip: 'hazir', surum: SURUM });
   })();
