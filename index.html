@@ -1,0 +1,164 @@
+<!doctype html>
+<html lang="tr">
+<head>
+  <meta charset="utf-8" />
+  <meta name="referrer" content="strict-origin-when-cross-origin" />
+  <title>YouTube aracısı</title>
+  <style>
+    html, body { margin: 0; background: transparent; overflow: hidden; }
+    #kutu { position: fixed; left: 0; top: 0; width: 200px; height: 200px; opacity: 0; overflow: hidden; pointer-events: none; }
+    #kutu iframe, #kutu div { width: 200px; height: 200px; border: 0; }
+    #bilgi { display: none; font: 15px/1.5 Georgia, serif; color: #444; max-width: 560px; margin: 40px auto; padding: 0 16px; }
+  </style>
+</head>
+<body>
+  <div id="kutu"></div>
+  <div id="bilgi">
+    <h1 style="font-size:20px">Gramofon için YouTube aracısı</h1>
+    <p>Bu sayfa oyunun içinde, görünmez bir çerçevede kullanılır. Oyunun kendi sayfaları YouTube'a geçerli bir adres
+      gösteremediği için (YouTube hata 153), oynatıcı bu https sayfasının içinde açılır. Sayfa yalnızca kendisini çerçeve
+      olarak yükleyen sayfadan gelen çal / ses / durdur komutlarını uygular; başka bir şey yapmaz ve hiçbir veri toplamaz.</p>
+  </div>
+  <script>
+  // Auralis ses calar (ui/sescalar) YouTube aracisi. GitHub Pages gibi bir https adresinde durur; oyun sayfasi
+  // (fw://resources) bunu iframe olarak yukler ve postMessage ile konusur:
+  //   ust -> araci: {kanal:'aur-yt', tip:'yukle', ad, surum, vid, gecen, zaman, dongu, durdu, ses} | {tip:'ses', ad, ses}
+  //                 | {tip:'durum', ad, durdu, gecen, zaman} | {tip:'sil', ad} | {tip:'hepsiniSil'}
+  //   araci -> ust: {kanal:'aur-yt', tip:'hazir'} | {tip:'olay', olay:'sure'|'bitti'|'hata', ad, surum, sure, baslik, kod}
+  // Yalniz kendisini yukleyen ust pencereden gelen mesajlari dinler.
+  (function () {
+    var KANAL = 'aur-yt';
+    var SURUM = 1;
+    var ust = window.parent;
+    if (!ust || ust === window) { document.getElementById('bilgi').style.display = 'block'; return; }
+    var kutu = document.getElementById('kutu');
+    var hedef = '*';
+    var sesler = {};
+    var sayac = 0;
+
+    function yolla(v) { v.kanal = KANAL; try { ust.postMessage(v, hedef); } catch (e) { /* yut */ } }
+    function olay(s, ad, ek) {
+      if (!s || s.olu) return;
+      var v = { tip: 'olay', olay: ad, ad: s.ad, surum: s.surum };
+      for (var k in (ek || {})) v[k] = ek[k];
+      yolla(v);
+    }
+    function sinirla(v) { v = Number(v); return isFinite(v) ? Math.max(0, Math.min(1, v)) : 0; }
+    function simdikiGecen(m) { return Math.max(0, Number(m.gecen) || 0) + (m.durdu ? 0 : Math.max(0, (Date.now() - (Number(m.zaman) || Date.now())) / 1000)); }
+
+    var ytDurum = 0;
+    var ytBekleyen = [];
+    function ytHazirla(fn, hata) {
+      if (ytDurum === 2) { fn(); return; }
+      if (ytDurum === 3) { hata('yt_api'); return; }
+      ytBekleyen.push({ fn: fn, hata: hata });
+      if (ytDurum === 1) return;
+      ytDurum = 1;
+      window.onYouTubeIframeAPIReady = function () {
+        ytDurum = 2;
+        var l = ytBekleyen; ytBekleyen = [];
+        l.forEach(function (b) { try { b.fn(); } catch (e) { /* yut */ } });
+      };
+      var s = document.createElement('script');
+      s.src = 'https://www.youtube.com/iframe_api';
+      s.onerror = yuklenemedi;
+      document.head.appendChild(s);
+      setTimeout(function () { if (ytDurum === 1) yuklenemedi(); }, 20000);
+    }
+    function yuklenemedi() {
+      ytDurum = 3;
+      var l = ytBekleyen; ytBekleyen = [];
+      l.forEach(function (b) { b.hata('yt_api'); });
+    }
+
+    function sesUygula(s) {
+      if (!s || s.olu || !s.yt || !s.hazir) return;
+      var v = sinirla(s.hedef);
+      try { s.yt.setVolume(Math.round(v * 100)); if (v > 0) s.yt.unMute(); } catch (e) { /* yut */ }
+    }
+    function yokEt(s) {
+      if (!s || s.olu) return;
+      s.olu = true;
+      if (s.yt) { try { s.yt.stopVideo(); } catch (e) { /* yut */ } try { s.yt.destroy(); } catch (e) { /* yut */ } s.yt = null; }
+      if (s.kap && s.kap.parentNode) s.kap.parentNode.removeChild(s.kap);
+    }
+    function sure(s, p) {
+      if (s.sureYollandi) return;
+      var d = 0; var b = '';
+      try { d = Number(p.getDuration()) || 0; } catch (e) { d = 0; }
+      try { var vd = p.getVideoData ? p.getVideoData() : null; b = (vd && vd.title) || ''; } catch (e) { b = ''; }
+      if (d > 0) { s.sureYollandi = true; olay(s, 'sure', { sure: d, baslik: String(b).slice(0, 80) }); }
+    }
+    function yukle(m) {
+      if (!/^[A-Za-z0-9_-]{11}$/.test(String(m.vid || ''))) return;
+      var eski = sesler[m.ad];
+      if (eski && eski.surum === m.surum && !eski.olu) { eski.hedef = m.ses; sesUygula(eski); return; }
+      if (eski) yokEt(eski);
+      var s = { ad: String(m.ad), surum: m.surum, hedef: sinirla(m.ses), dongu: !!m.dongu, durdu: !!m.durdu, hazir: false, olu: false, sureYollandi: false };
+      sesler[s.ad] = s;
+      ytHazirla(function () {
+        if (s.olu) return;
+        var kap = document.createElement('div');
+        kap.id = 'yt_' + (++sayac);
+        kutu.appendChild(kap);
+        s.kap = kap;
+        var bas = Math.floor(simdikiGecen(m));
+        s.yt = new YT.Player(kap.id, {
+          width: '200', height: '200', videoId: m.vid,
+          playerVars: { autoplay: m.durdu ? 0 : 1, controls: 0, disablekb: 1, fs: 0, rel: 0, playsinline: 1, iv_load_policy: 3, start: bas },
+          events: {
+            onReady: function (e) {
+              if (s.olu) return;
+              s.hazir = true;
+              s.kap = e.target.getIframe ? e.target.getIframe() : s.kap;
+              sesUygula(s);
+              var d = Number(e.target.getDuration()) || 0;
+              var g = simdikiGecen(m);
+              if (d > 0) {
+                sure(s, e.target);
+                if (!s.dongu && g >= d - 0.5) { try { e.target.pauseVideo(); } catch (x) { /* yut */ } olay(s, 'bitti'); return; }
+                if (s.dongu) g = g % d;
+              }
+              if (Math.abs(g - bas) > 1.5) { try { e.target.seekTo(g, true); } catch (x) { /* yut */ } }
+              if (!s.durdu) { try { e.target.playVideo(); } catch (x) { /* yut */ } } else { try { e.target.pauseVideo(); } catch (x) { /* yut */ } }
+            },
+            onStateChange: function (e) {
+              if (s.olu) return;
+              if (e.data === 1) sure(s, e.target);
+              if (e.data === 0) {
+                if (s.dongu) { try { e.target.seekTo(0, true); e.target.playVideo(); } catch (x) { /* yut */ } } else olay(s, 'bitti');
+              }
+            },
+            onError: function (e) { if (!s.olu) olay(s, 'hata', { kod: e && e.data != null ? e.data : '?' }); },
+          },
+        });
+      }, function (kod) { olay(s, 'hata', { kod: kod }); });
+    }
+    function durum(m) {
+      var s = sesler[m.ad];
+      if (!s || s.olu) return;
+      s.durdu = !!m.durdu;
+      if (!s.yt || !s.hazir) return;
+      try {
+        if (s.durdu) s.yt.pauseVideo();
+        else { s.yt.seekTo(simdikiGecen(m), true); s.yt.playVideo(); }
+      } catch (e) { /* yut */ }
+    }
+
+    window.addEventListener('message', function (e) {
+      if (e.source !== ust) return;
+      var m = e.data;
+      if (!m || typeof m !== 'object' || m.kanal !== KANAL) return;
+      if (e.origin && e.origin !== 'null') hedef = e.origin;
+      if (m.tip === 'yukle') yukle(m);
+      else if (m.tip === 'ses') { var s = sesler[m.ad]; if (s) { s.hedef = m.ses; sesUygula(s); } }
+      else if (m.tip === 'durum') durum(m);
+      else if (m.tip === 'sil') { yokEt(sesler[m.ad]); delete sesler[m.ad]; }
+      else if (m.tip === 'hepsiniSil') { Object.keys(sesler).forEach(function (a) { yokEt(sesler[a]); }); sesler = {}; }
+      else if (m.tip === 'merhaba') yolla({ tip: 'hazir', surum: SURUM });
+    });
+    yolla({ tip: 'hazir', surum: SURUM });
+  })();
+  </script>
+</body>
+</html>
